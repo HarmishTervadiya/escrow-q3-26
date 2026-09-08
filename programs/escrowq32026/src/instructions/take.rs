@@ -7,7 +7,7 @@ use anchor_spl::{
     },
 };
 
-use crate::{state::Escrow, ESCROW_SEED, ErrorCode};
+use crate::{state::Escrow, EscrowError, ESCROW_SEED};
 
 #[derive(Accounts)]
 pub struct Take<'info> {
@@ -16,31 +16,32 @@ pub struct Take<'info> {
 
     #[account(
         init_if_needed,
-        payer= taker,
-    associated_token::authority = taker,
-    associated_token::mint = mint_a,
-    associated_token::token_program = token_program
+        payer = taker,
+        associated_token::authority = taker,
+        associated_token::mint = mint_a,
+        associated_token::token_program = token_program
     )]
-    pub taker_ata_a: InterfaceAccount<'info, TokenAccount>,
+    pub taker_ata_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         mut,
         associated_token::mint = mint_b,
-        associated_token::authority = taker
+        associated_token::authority = taker,
+        associated_token::token_program = token_program
     )]
-    pub taker_ata_b: InterfaceAccount<'info, TokenAccount>,
+    pub taker_ata_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
     pub maker: SystemAccount<'info>,
 
     #[account(
         init_if_needed,
-        payer= taker,
+        payer = taker,
         associated_token::mint = mint_b,
         associated_token::authority = maker,
         associated_token::token_program = token_program
-)]
-    pub maker_ata_b: InterfaceAccount<'info, TokenAccount>,
+    )]
+    pub maker_ata_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     pub mint_a: InterfaceAccount<'info, Mint>,
     pub mint_b: InterfaceAccount<'info, Mint>,
@@ -54,13 +55,15 @@ pub struct Take<'info> {
         seeds = [ESCROW_SEED, maker.key().as_ref(), escrow.seed.to_le_bytes().as_ref()],
         bump = escrow.bump
     )]
-    pub escrow: Account<'info, Escrow>,
+    pub escrow: Box<Account<'info, Escrow>>,
 
-    #[account(mut,
-    associated_token::mint = mint_a,
-    associated_token::authority = escrow
+    #[account(
+        mut,
+        associated_token::mint = mint_a,
+        associated_token::authority = escrow,
+        associated_token::token_program = token_program
     )]
-    pub vault: InterfaceAccount<'info, TokenAccount>,
+    pub vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     pub system_program: Program<'info, System>,
     pub token_program: Interface<'info, TokenInterface>,
@@ -69,20 +72,19 @@ pub struct Take<'info> {
 
 impl<'info> Take<'info> {
     pub fn take(&mut self) -> Result<()> {
+        let seed_bytes = self.escrow.seed.to_le_bytes();
+        let bump_bytes = [self.escrow.bump];
 
-        // Prior check so we do not waste compute, 
-        // it will throw error due to name collision with anchor lang, 
-        // require!(self.taker_ata_b.amount >= self.escrow.receive, ErrorCode::InsufficinetFunds);
-
-        let signer_seeds: [&[&[u8]]; 1] = [&[
+        let signer_seeds: &[&[&[u8]]] = &[&[
             ESCROW_SEED,
             self.maker.key.as_ref(),
-            &self.escrow.seed.to_le_bytes()[..],
-            &[self.escrow.bump],
+            &seed_bytes,
+            &bump_bytes,
         ]];
 
         let cpi_program = self.token_program.key();
 
+        // Transfer mint_a from vault → taker (PDA signs)
         let cpi_accounts = TransferChecked {
             authority: self.escrow.to_account_info(),
             from: self.vault.to_account_info(),
@@ -90,10 +92,10 @@ impl<'info> Take<'info> {
             mint: self.mint_a.to_account_info(),
         };
 
-        let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, &signer_seeds);
-
+        let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
         transfer_checked(cpi_context, self.vault.amount, self.mint_a.decimals)?;
 
+        // Transfer mint_b from taker → maker (taker signs)
         let cpi_accounts = TransferChecked {
             authority: self.taker.to_account_info(),
             from: self.taker_ata_b.to_account_info(),
@@ -102,17 +104,16 @@ impl<'info> Take<'info> {
         };
 
         let cpi_context = CpiContext::new(cpi_program, cpi_accounts);
-
         transfer_checked(cpi_context, self.escrow.receive, self.mint_b.decimals)?;
 
+        // Close vault → rent returned to maker (PDA signs)
         let cpi_accounts = CloseAccount {
             account: self.vault.to_account_info(),
             destination: self.maker.to_account_info(),
             authority: self.escrow.to_account_info(),
         };
 
-        let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, &signer_seeds);
-
+        let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
         close_account(cpi_context)?;
 
         Ok(())
